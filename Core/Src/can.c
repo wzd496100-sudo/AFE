@@ -95,6 +95,8 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
   HAL_NVIC_EnableIRQ(USB_HP_CAN1_TX_IRQn);
   HAL_NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+  HAL_NVIC_SetPriority(CAN1_SCE_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(CAN1_SCE_IRQn);
 }
 
 void HAL_CAN_MspDeInit(CAN_HandleTypeDef* canHandle)

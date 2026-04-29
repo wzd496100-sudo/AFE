@@ -63,8 +63,9 @@ static const uint8_t s_phys_pair_for_cell13[BQ76940_ACTIVE_CELL_COUNT] = {
 #define BQ76940_TS_NTC_R0_OHM     (10000.0f)
 #define BQ76940_TS_NTC_BETA       (3435.0f)
 
-/* Set to 1 to enable internal CAN loopback test (no transceiver required) */
-#define BQ76940_CAN_LOOPBACK_TEST  (1u)
+/* Set to 1 to enable internal CAN loopback test (no transceiver required).
+   Keep this disabled for real bus communication with an external CAN analyzer. */
+#define BQ76940_CAN_LOOPBACK_TEST  (0u)
 
 /* LED pack voltage thresholds for 13-cell configuration:
    Min pack: 2.5V * 13 = 32500 mV
