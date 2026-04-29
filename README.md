@@ -120,3 +120,41 @@ Charge / discharge:
 ## Build note
 
 Local build was not completed in this terminal session because `cmake` is not installed in the current shell environment.
+
+## PC CAN monitor
+
+A simple Windows GUI monitor was added under `tools/`.
+
+Files:
+
+- `tools/afe_can_monitor.py`
+- `tools/install_can_monitor.bat`
+- `tools/start_can_monitor.bat`
+
+Use it like this:
+
+1. Run `tools\install_can_monitor.bat`
+2. Run `tools\start_can_monitor.bat`
+3. Set interface, channel, bitrate, then click `Connect`
+
+The monitor decodes frames:
+
+- `0x500` to `0x504` application data
+- `0x505` to `0x506` debug data
+
+Typical settings:
+
+- `slcan`: channel `COM3`, serial baud `115200`, bitrate `500000`
+- `pcan`: channel like `PCAN_USBBUS1`, bitrate `500000`
+- `vector`: channel like `0`, bitrate `500000`
+
+What you will see:
+
+- pack voltage
+- all 13 cell voltages
+- `SYS_STAT` and decoded fault flags
+- `SYS_CTRL2`
+- charge / discharge FET state
+- balance state
+- I2C error and CAN TX status
+- raw CAN frame log
