@@ -95,6 +95,7 @@ static const uint8_t s_phys_pair_for_cell13[BQ76940_ACTIVE_CELL_COUNT] = {
 #define BQ76940_RECOVER_BLOCK_FAULT        (2u)
 #define BQ76940_RECOVER_BLOCK_OVRD_ALERT   (3u)
 #define BQ76940_RECOVER_BLOCK_DISABLED     (4u)
+#define BQ76940_RECOVER_BLOCK_CELL_HIGH    (5u)
 #define BQ76940_SYS_CTRL2_CHG_ON  (0x01u)
 #define BQ76940_SYS_CTRL2_DSG_ON  (0x02u)
 #define BQ76940_SYS_CTRL2_CC_ONESHOT (0x20u)
@@ -107,12 +108,17 @@ static const uint8_t s_phys_pair_for_cell13[BQ76940_ACTIVE_CELL_COUNT] = {
 #define BQ76940_BALANCE_STOP_DELTA_MV  (15u)
 #define BQ76940_BALANCE_DEFAULT_TIMEOUT_MS (30000u)
 #define BQ76940_BALANCE_COOLDOWN_MS (5000u)
+#define BQ76940_CHARGE_ENABLE       (1u)
+#define BQ76940_CHARGE_RESUME_CELL_MV (4150u)
+#define BQ76940_CHARGE_STOP_CELL_MV   (4200u)
 #define BQ76940_CAN_TX_PERIOD_MS    (500u)
 #define BQ76940_CAN_ID_STATUS       (0x500u)
 #define BQ76940_CAN_ID_CELLS_1_4    (0x501u)
 #define BQ76940_CAN_ID_CELLS_5_8    (0x502u)
 #define BQ76940_CAN_ID_CELLS_9_12   (0x503u)
 #define BQ76940_CAN_ID_CELLS_13     (0x504u)
+#define BQ76940_CAN_ID_DEBUG_1      (0x505u)
+#define BQ76940_CAN_ID_DEBUG_2      (0x506u)
 #define BQ76940_DEBUG_HISTORY_COUNT (16u)
 #define BQ76940_STATUS_LED_PERIOD_MS (200u)
 #define BQ76940_LED_SERVICE_STEP_MS  (1u)
@@ -127,9 +133,11 @@ static const uint8_t s_phys_pair_for_cell13[BQ76940_ACTIVE_CELL_COUNT] = {
 typedef struct
 {
   uint8_t pause_loop;
+  uint8_t enable_auto_chg_recover;
   uint8_t enable_auto_dsg_recover;
   uint8_t auto_clear_cc_ready;
   uint8_t manual_clear_sys_stat;
+  uint8_t manual_enable_chg;
   uint8_t manual_enable_dsg;
   uint8_t clear_recover_latch;
   uint8_t balance_cell;
@@ -143,12 +151,17 @@ typedef struct
   uint16_t balance_cell_delta_mv;
   uint16_t balance_cell_min_mv;
   uint16_t balance_cell_max_mv;
+  uint8_t last_charge_block_reason;
+  uint8_t last_charge_sys_stat;
+  uint8_t last_charge_sys_ctrl2;
   uint8_t last_recover_block_reason;
   uint8_t last_recover_sys_stat;
   uint8_t last_recover_sys_ctrl2;
   uint32_t pause_enter_count;
   uint32_t manual_clear_count;
+  uint32_t manual_enable_chg_count;
   uint32_t manual_enable_dsg_count;
+  uint32_t charge_recover_count;
   uint32_t recover_latch_count;
   uint32_t balance_timeout_ms;
   uint32_t balance_started_tick_ms;
@@ -228,9 +241,11 @@ typedef struct
   uint8_t sys_stat_effective;
   uint8_t using_plain_fallback;
   uint8_t led1_is_blinking;
+  uint8_t chg_on;
   uint8_t dsg_on;
   uint8_t led_bar_mask;
   uint8_t led_breath_duty;
+  uint16_t cell_mv_max;
   uint32_t fet_recover_count;
   uint8_t alert_afe_level;
   uint8_t alert_gauge_level;
@@ -281,9 +296,11 @@ volatile BQ76940_Watch_t g_bq76940_watch = {0u};
 volatile BQ76940_Debug_t g_bq76940_debug = {0u};
 volatile BQ76940_Control_t g_bq76940_control = {
   .pause_loop = 0u,
+  .enable_auto_chg_recover = BQ76940_CHARGE_ENABLE,
   .enable_auto_dsg_recover = 0u,
   .auto_clear_cc_ready = 0u,
   .manual_clear_sys_stat = 0u,
+  .manual_enable_chg = 0u,
   .manual_enable_dsg = 0u,
   .clear_recover_latch = 0u,
   .balance_cell = 0u,
@@ -297,12 +314,17 @@ volatile BQ76940_Control_t g_bq76940_control = {
   .balance_cell_delta_mv = 0u,
   .balance_cell_min_mv = 0u,
   .balance_cell_max_mv = 0u,
+  .last_charge_block_reason = BQ76940_RECOVER_BLOCK_NONE,
+  .last_charge_sys_stat = 0u,
+  .last_charge_sys_ctrl2 = 0u,
   .last_recover_block_reason = BQ76940_RECOVER_BLOCK_NONE,
   .last_recover_sys_stat = 0u,
   .last_recover_sys_ctrl2 = 0u,
   .pause_enter_count = 0u,
   .manual_clear_count = 0u,
+  .manual_enable_chg_count = 0u,
   .manual_enable_dsg_count = 0u,
+  .charge_recover_count = 0u,
   .recover_latch_count = 0u,
   .balance_timeout_ms = BQ76940_BALANCE_DEFAULT_TIMEOUT_MS,
   .balance_started_tick_ms = 0u,
@@ -337,6 +359,7 @@ static uint8_t BQ76940_GetPackLedMask(void);
 static uint8_t BQ76940_GetLedBreathOn(uint32_t tickMs);
 static void BQ76940_UpdateDebugSnapshot(HAL_StatusTypeDef crcReadStatus,
                                         HAL_StatusTypeDef plainReadStatus);
+static void BQ76940_UpdateChargeFet(void);
 static void BQ76940_RecoverDischargeFet(void);
 static void BQ76940_ServiceDebugControl(void);
 static void BQ76940_ServiceDebugPauseLoop(void);
@@ -458,6 +481,7 @@ int main(void)
     BQ76940_SamplePackAdcPin();
     BQ76940_CAN_PollRx();
     BQ76940_UpdateCellBalanceAlgorithm();
+    BQ76940_UpdateChargeFet();
 
     if (crcReadStatus == HAL_OK)
     {
@@ -586,11 +610,13 @@ static void BQ76940_StartMeasurements(void)
   /* Set SYS_STAT to 0xFF to clear any latched faults (e.g. DEVICE_XREADY) before enabling FETs */
   (void)BQ76940_WriteRegisterFallback(BQ76940_REG_SYS_STAT, 0xFFu);
 
-  /* Enable Coulomb Counter AND Discharge FET in SYS_CTRL2 */
+  /* Enable Coulomb Counter plus charge/discharge FETs during startup.
+     Runtime logic will later turn CHG/DSG on or off as protections require. */
   if (BQ76940_ReadRegisterFallback(BQ76940_REG_SYS_CTRL2, &sysCtrl2) == HAL_OK)
   {
-    /* Bit 6 = CC_EN, Bit 1 = DSG_ON */
-    sysCtrl2 |= (0x40u | 0x02u);
+    sysCtrl2 |= (BQ76940_SYS_CTRL2_CC_EN |
+                 BQ76940_SYS_CTRL2_CHG_ON |
+                 BQ76940_SYS_CTRL2_DSG_ON);
     (void)BQ76940_WriteRegisterFallback(BQ76940_REG_SYS_CTRL2, sysCtrl2);
   }
 }
@@ -993,6 +1019,100 @@ static uint8_t BQ76940_GetLedBreathOn(uint32_t tickMs)
   return (pwmPhase < duty) ? 1u : 0u;
 }
 
+static void BQ76940_UpdateChargeFet(void)
+{
+  uint8_t idx;
+  uint8_t sysStat;
+  uint8_t sysCtrl2;
+  uint8_t desiredChgOn;
+  uint16_t maxCellMv;
+  uint8_t chargeBitWasOn;
+
+  g_bq76940_control.last_charge_block_reason = BQ76940_RECOVER_BLOCK_NONE;
+  sysStat = g_bq76940_watch.sys_stat_effective;
+  g_bq76940_control.last_charge_sys_stat = sysStat;
+
+  if (BQ76940_ReadRegisterFallback(BQ76940_REG_SYS_CTRL2, &sysCtrl2) != HAL_OK)
+  {
+    g_bq76940_control.last_charge_block_reason = BQ76940_RECOVER_BLOCK_COMM;
+    return;
+  }
+
+  g_bq76940_control.last_charge_sys_ctrl2 = sysCtrl2;
+  chargeBitWasOn = ((sysCtrl2 & BQ76940_SYS_CTRL2_CHG_ON) != 0u) ? 1u : 0u;
+
+  if (g_bq76940_control.enable_auto_chg_recover == 0u)
+  {
+    g_bq76940_control.last_charge_block_reason = BQ76940_RECOVER_BLOCK_DISABLED;
+    return;
+  }
+
+  maxCellMv = 0u;
+  for (idx = 0u; idx < BQ76940_ACTIVE_CELL_COUNT; idx++)
+  {
+    if (g_bq76940_watch.cell_mv[idx] == 0u)
+    {
+      return;
+    }
+
+    if (g_bq76940_watch.cell_mv[idx] > maxCellMv)
+    {
+      maxCellMv = g_bq76940_watch.cell_mv[idx];
+    }
+  }
+  g_bq76940_watch.cell_mv_max = maxCellMv;
+
+  desiredChgOn = 1u;
+  if ((sysStat & (uint8_t)(BQ76940_SYS_STAT_FAULT_MASK | BQ76940_SYS_STAT_OVRD_ALERT)) != 0u)
+  {
+    desiredChgOn = 0u;
+    g_bq76940_control.last_charge_block_reason = ((sysStat & BQ76940_SYS_STAT_OVRD_ALERT) != 0u) ?
+                                                 BQ76940_RECOVER_BLOCK_OVRD_ALERT :
+                                                 BQ76940_RECOVER_BLOCK_FAULT;
+  }
+  else if (chargeBitWasOn != 0u)
+  {
+    if (maxCellMv >= BQ76940_CHARGE_STOP_CELL_MV)
+    {
+      desiredChgOn = 0u;
+      g_bq76940_control.last_charge_block_reason = BQ76940_RECOVER_BLOCK_CELL_HIGH;
+    }
+  }
+  else if (maxCellMv > BQ76940_CHARGE_RESUME_CELL_MV)
+  {
+    desiredChgOn = 0u;
+    g_bq76940_control.last_charge_block_reason = BQ76940_RECOVER_BLOCK_CELL_HIGH;
+  }
+
+  if (desiredChgOn != 0u)
+  {
+    sysCtrl2 |= (BQ76940_SYS_CTRL2_CC_EN | BQ76940_SYS_CTRL2_CHG_ON);
+  }
+  else
+  {
+    sysCtrl2 = (uint8_t)((sysCtrl2 | BQ76940_SYS_CTRL2_CC_EN) &
+                         (uint8_t)(~BQ76940_SYS_CTRL2_CHG_ON));
+  }
+
+  if (sysCtrl2 != g_bq76940_control.last_charge_sys_ctrl2)
+  {
+    if (BQ76940_WriteRegisterFallback(BQ76940_REG_SYS_CTRL2, sysCtrl2) == HAL_OK)
+    {
+      g_bq76940_watch.reg_value[BQ76940_REG_SYS_CTRL2] = sysCtrl2;
+      g_bq76940_watch.reg_source[BQ76940_REG_SYS_CTRL2] = 1u;
+      g_bq76940_control.last_charge_sys_ctrl2 = sysCtrl2;
+      if (desiredChgOn != 0u)
+      {
+        g_bq76940_control.charge_recover_count++;
+      }
+    }
+    else
+    {
+      g_bq76940_control.last_charge_block_reason = BQ76940_RECOVER_BLOCK_COMM;
+    }
+  }
+}
+
 static void BQ76940_RecoverDischargeFet(void)
 {
   uint8_t sysStat;
@@ -1148,6 +1268,22 @@ static void BQ76940_ServiceDebugControl(void)
       if (BQ76940_WriteRegisterFallback(BQ76940_REG_SYS_CTRL2, sysCtrl2) == HAL_OK)
       {
         g_bq76940_control.manual_enable_dsg_count++;
+      }
+    }
+  }
+
+  if (g_bq76940_control.manual_enable_chg != 0u)
+  {
+    g_bq76940_control.manual_enable_chg = 0u;
+
+    if ((BQ76940_ReadRegisterFallback(BQ76940_REG_SYS_STAT, &sysStat) == HAL_OK) &&
+        ((sysStat & (uint8_t)(BQ76940_SYS_STAT_FAULT_MASK | BQ76940_SYS_STAT_OVRD_ALERT)) == 0u) &&
+        (BQ76940_ReadRegisterFallback(BQ76940_REG_SYS_CTRL2, &sysCtrl2) == HAL_OK))
+    {
+      sysCtrl2 |= (BQ76940_SYS_CTRL2_CC_EN | BQ76940_SYS_CTRL2_CHG_ON);
+      if (BQ76940_WriteRegisterFallback(BQ76940_REG_SYS_CTRL2, sysCtrl2) == HAL_OK)
+      {
+        g_bq76940_control.manual_enable_chg_count++;
       }
     }
   }
@@ -1412,6 +1548,7 @@ static void BQ76940_CAN_SendStatus(void)
   uint8_t data[8];
   uint32_t nowTick;
   uint8_t sysCtrl2;
+  uint8_t debugFlags;
 
   static uint32_t s_lastCanTxTick = 0u;
 
@@ -1477,6 +1614,52 @@ static void BQ76940_CAN_SendStatus(void)
   data[6] = (uint8_t)(g_bq76940_control.balance_cell_delta_mv & 0xFFu);
   data[7] = (uint8_t)(g_bq76940_control.balance_cell_delta_mv >> 8u);
   (void)BQ76940_CAN_SendFrame(BQ76940_CAN_ID_CELLS_13, data);
+
+  debugFlags = 0u;
+  if (g_bq76940_watch.using_plain_fallback != 0u)
+  {
+    debugFlags |= 0x01u;
+  }
+  if (g_bq76940_watch.alert_afe_level == (uint8_t)GPIO_PIN_RESET)
+  {
+    debugFlags |= 0x02u;
+  }
+  if (g_bq76940_watch.alert_gauge_level == (uint8_t)GPIO_PIN_RESET)
+  {
+    debugFlags |= 0x04u;
+  }
+  if (g_bq76940_watch.chg_on != 0u)
+  {
+    debugFlags |= 0x08u;
+  }
+  if (g_bq76940_watch.dsg_on != 0u)
+  {
+    debugFlags |= 0x10u;
+  }
+  if (g_bq76940_control.balance_active_cell != 0u)
+  {
+    debugFlags |= 0x20u;
+  }
+
+  data[0] = g_bq76940_watch.sys_stat_effective;
+  data[1] = sysCtrl2;
+  data[2] = g_bq76940_control.last_recover_block_reason;
+  data[3] = g_bq76940_control.last_charge_block_reason;
+  data[4] = (uint8_t)(g_bq76940_watch.last_hal_i2c_error & 0xFFu);
+  data[5] = (uint8_t)g_bq76940_control.last_can_tx_status;
+  data[6] = debugFlags;
+  data[7] = g_bq76940_watch.led_bar_mask;
+  (void)BQ76940_CAN_SendFrame(BQ76940_CAN_ID_DEBUG_1, data);
+
+  data[0] = (uint8_t)(g_bq76940_watch.cc_raw & 0xFFu);
+  data[1] = (uint8_t)((uint16_t)g_bq76940_watch.cc_raw >> 8u);
+  data[2] = (uint8_t)(g_bq76940_watch.cell_mv_max & 0xFFu);
+  data[3] = (uint8_t)(g_bq76940_watch.cell_mv_max >> 8u);
+  data[4] = (uint8_t)(g_bq76940_control.charge_recover_count & 0xFFu);
+  data[5] = (uint8_t)(g_bq76940_watch.fet_recover_count & 0xFFu);
+  data[6] = (uint8_t)(g_bq76940_control.can_rx_count & 0xFFu);
+  data[7] = (uint8_t)(g_bq76940_control.can_tx_fail_count & 0xFFu);
+  (void)BQ76940_CAN_SendFrame(BQ76940_CAN_ID_DEBUG_2, data);
 }
 
 static HAL_StatusTypeDef BQ76940_CAN_SendFrame(uint32_t stdId, const uint8_t data[8])
@@ -1549,6 +1732,7 @@ static void BQ76940_ServiceDebugPauseLoop(void)
   {
     g_bq76940_watch.reg_value[BQ76940_REG_SYS_CTRL2] = sysCtrl2;
     g_bq76940_watch.reg_source[BQ76940_REG_SYS_CTRL2] = 1u;
+    g_bq76940_watch.chg_on = ((sysCtrl2 & BQ76940_SYS_CTRL2_CHG_ON) != 0u) ? 1u : 0u;
     g_bq76940_watch.dsg_on = ((sysCtrl2 & BQ76940_SYS_CTRL2_DSG_ON) != 0u) ? 1u : 0u;
   }
 
@@ -1573,6 +1757,9 @@ static void BQ76940_UpdateDebugSnapshot(HAL_StatusTypeDef crcReadStatus,
   {
     sysCtrl2 = g_bq76940_watch.reg_value[BQ76940_REG_SYS_CTRL2];
   }
+
+  g_bq76940_watch.chg_on = ((sysCtrl2 & BQ76940_SYS_CTRL2_CHG_ON) != 0u) ? 1u : 0u;
+  g_bq76940_watch.dsg_on = ((sysCtrl2 & BQ76940_SYS_CTRL2_DSG_ON) != 0u) ? 1u : 0u;
 
   snapshot.tick_ms = HAL_GetTick();
   snapshot.pack_mv = g_bq76940_watch.pack_mv;
@@ -1603,6 +1790,8 @@ static void BQ76940_UpdateDebugSnapshot(HAL_StatusTypeDef crcReadStatus,
   snapshot.cellbal2 = g_bq76940_watch.reg_value[BQ76940_REG_CELLBAL2];
   snapshot.cellbal3 = g_bq76940_watch.reg_value[BQ76940_REG_CELLBAL3];
   snapshot.balance_active_cell = g_bq76940_control.balance_active_cell;
+  snapshot.balance_candidate_cell = g_bq76940_control.balance_candidate_cell;
+  snapshot.balance_cell_delta_mv = g_bq76940_control.balance_cell_delta_mv;
   snapshot.fet_recover_count = g_bq76940_watch.fet_recover_count;
   snapshot.recover_block_reason = g_bq76940_control.last_recover_block_reason;
   snapshot.led_bar_mask = g_bq76940_watch.led_bar_mask;
